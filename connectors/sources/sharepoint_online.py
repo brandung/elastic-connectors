@@ -855,19 +855,49 @@ class SharepointOnlineClient:
         self._logger.debug(
             f"Requesting site '{allowed_site}' and subsites by relative path in host: {sharepoint_host}"
         )
-        site_with_subsites = await self._graph_api_client.fetch(
-            f"{GRAPH_API_URL}/sites/{sharepoint_host}:/sites/{allowed_site}?expand=sites"
-        )
-        async for site in self._recurse_sites(site_with_subsites):
-            yield site
+        # Try /sites/ path first (standard SharePoint sites)
+        try:
+            site_with_subsites = await self._graph_api_client.fetch(
+                f"{GRAPH_API_URL}/sites/{sharepoint_host}:/sites/{allowed_site}?expand=sites"
+            )
+            async for site in self._recurse_sites(site_with_subsites):
+                yield site
+            return
+        except NotFound:
+            pass
+        
+        # Try /teams/ path (Microsoft Teams sites)
+        try:
+            self._logger.debug(
+                f"Site not found under /sites/, trying /teams/ path for '{allowed_site}'"
+            )
+            site_with_subsites = await self._graph_api_client.fetch(
+                f"{GRAPH_API_URL}/sites/{sharepoint_host}:/teams/{allowed_site}?expand=sites"
+            )
+            async for site in self._recurse_sites(site_with_subsites):
+                yield site
+            return
+        except NotFound:
+            # Re-raise NotFound if both paths fail
+            raise
 
     async def _fetch_site(self, sharepoint_host, allowed_site):
         self._logger.debug(
             f"Requesting site '{allowed_site}' by relative path in parent site: {sharepoint_host}"
         )
-        return await self._graph_api_client.fetch(
-            f"{GRAPH_API_URL}/sites/{sharepoint_host}:/sites/{allowed_site}"
-        )
+        # Try /sites/ path first (standard SharePoint sites)
+        try:
+            return await self._graph_api_client.fetch(
+                f"{GRAPH_API_URL}/sites/{sharepoint_host}:/sites/{allowed_site}"
+            )
+        except NotFound:
+            # Try /teams/ path (Microsoft Teams sites)
+            self._logger.debug(
+                f"Site not found under /sites/, trying /teams/ path for '{allowed_site}'"
+            )
+            return await self._graph_api_client.fetch(
+                f"{GRAPH_API_URL}/sites/{sharepoint_host}:/teams/{allowed_site}"
+            )
 
     async def _scroll_subsites_by_parent_id(self, parent_site_id):
         self._logger.debug(f"Scrolling subsites of {parent_site_id}")
@@ -1489,11 +1519,26 @@ class SharepointOnlineDataSource(BaseDataSource):
             raise Exception(msg)
 
     def _site_path_from_web_url(self, web_url):
-        url_parts = web_url.split("/sites/")
-        site_path_parts = url_parts[1:]
-        return "/sites/".join(
-            site_path_parts
-        )  # just in case there was a /sites/ in the site path
+        # Handle both /sites/ and /teams/ paths
+        if "/sites/" in web_url:
+            url_parts = web_url.split("/sites/")
+            site_path_parts = url_parts[1:]
+            return "/sites/".join(
+                site_path_parts
+            )  # just in case there was a /sites/ in the site path
+        elif "/teams/" in web_url:
+            url_parts = web_url.split("/teams/")
+            site_path_parts = url_parts[1:]
+            return "/teams/".join(
+                site_path_parts
+            )  # just in case there was a /teams/ in the site path
+        else:
+            # Fallback: try to extract site name from URL
+            # For URLs like https://tenant.sharepoint.com/sites/SiteName or https://tenant.sharepoint.com/teams/SiteName
+            parts = web_url.rstrip("/").split("/")
+            if len(parts) >= 2:
+                return parts[-1]  # Return the last part as site name
+            return web_url
 
     def _decorate_with_access_control(self, document, access_control):
         if self._dls_enabled():
