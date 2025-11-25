@@ -703,10 +703,25 @@ class SharepointOnlineClient:
 
         url = f"{site_web_url}/_api/web/roleassignments?$expand={expand}"
 
+        self._logger.debug(
+            f"Fetching role assignments for site: {site_web_url} (URL: {url})"
+        )
+
         try:
+            total_count = 0
             async for page in self._rest_api_client.scroll(url):
+                page_count = len(page)
+                total_count += page_count
+                self._logger.debug(
+                    f"Received page with {page_count} role assignments for site {site_web_url} "
+                    f"(total so far: {total_count})"
+                )
                 for role_assignment in page:
                     yield role_assignment
+            self._logger.debug(
+                f"Completed fetching role assignments for site {site_web_url}: "
+                f"total {total_count} role assignments found"
+            )
         except NotFound:
             self._logger.debug(f"No role assignments found for site: '{site_web_url}'")
             return
@@ -1568,8 +1583,12 @@ class SharepointOnlineDataSource(BaseDataSource):
                 ]
         """
 
-        self._logger.debug(f"Looking at site: {site['id']} with url {site['webUrl']}")
+        self._logger.debug(
+            f"Processing site-level access control for site: {site['id']} "
+            f"with URL: {site['webUrl']}"
+        )
         if not self._dls_enabled():
+            self._logger.debug("Document Level Security (DLS) is not enabled, skipping access control")
             return [], []
 
         def _is_site_admin(user):
@@ -1577,26 +1596,72 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         access_control = set()
         site_admins_access_control = set()
+        role_assignment_count = 0
 
         async for role_assignment in self.client.site_role_assignments(site["webUrl"]):
-            member = role_assignment["Member"]
-            member_access_control = set()
-            member_access_control.update(
-                await self._get_access_control_from_role_assignment(role_assignment)
+            role_assignment_count += 1
+            member = role_assignment.get("Member", {})
+            member_id = member.get("Id", "unknown")
+            member_title = member.get("Title", "unknown")
+            identity_type = member.get("odata.type", "unknown")
+
+            self._logger.debug(
+                f"Processing role assignment #{role_assignment_count} for site {site['webUrl']}: "
+                f"member_id={member_id}, member_title={member_title}, "
+                f"identity_type={identity_type}"
             )
 
+            member_access_control = set()
+            extracted_access_control = await self._get_access_control_from_role_assignment(role_assignment)
+            member_access_control.update(extracted_access_control)
+
+            if extracted_access_control:
+                self._logger.debug(
+                    f"Extracted access control from role assignment #{role_assignment_count}: "
+                    f"{extracted_access_control}"
+                )
+            else:
+                self._logger.debug(
+                    f"No access control extracted from role assignment #{role_assignment_count} "
+                    f"(likely limited access or no view permissions)"
+                )
+
             if _is_site_admin(member):
+                self._logger.debug(
+                    f"Member {member_title} (id: {member_id}) is a site admin, "
+                    f"adding to site_admins_access_control"
+                )
                 # These are likely in the "Owners" group for the site
                 site_admins_access_control |= member_access_control
 
             access_control |= member_access_control
 
+        self._logger.debug(
+            f"Processed {role_assignment_count} role assignments for site {site['webUrl']}"
+        )
+
         # This fetches the "Site Collection Administrators", which is distinct from the "Owners" group of the site
         # however, both should have access to everything in the site, regardless of unique role assignments
+        site_admin_count = 0
         async for member in self.client.site_admins(site["webUrl"]):
+            site_admin_count += 1
             site_admins_access_control.update(
                 await self._access_control_for_member(member)
             )
+
+        if site_admin_count > 0:
+            self._logger.debug(
+                f"Found {site_admin_count} site collection administrators for site {site['webUrl']}"
+            )
+
+        final_access_control_count = len(access_control)
+        final_admin_access_control_count = len(site_admins_access_control)
+
+        self._logger.debug(
+            f"Final access control summary for site {site['webUrl']}: "
+            f"regular_access_control={final_access_control_count} identities, "
+            f"admin_access_control={final_admin_access_control_count} identities"
+        )
 
         return list(access_control), list(site_admins_access_control)
 
@@ -2370,31 +2435,54 @@ class SharepointOnlineDataSource(BaseDataSource):
         If any role is assigned to a user this means at least "read" access.
         """
 
+        role_assignment_id = role_assignment.get("odata.id", "unknown")
+
         def _has_limited_access(role_assignment):
             bindings = role_assignment.get("RoleDefinitionBindings", [])
 
             # If there is no permission information, default to restrict access
             if not bindings:
                 self._logger.debug(
-                    f"No RoleDefinitionBindings found for '{role_assignment.get('odata.id')}'"
+                    f"No RoleDefinitionBindings found for role assignment '{role_assignment_id}'"
                 )
                 return True
 
+            self._logger.debug(
+                f"Found {len(bindings)} role definition bindings for role assignment '{role_assignment_id}'"
+            )
+
             # if any binding grants view access, this role assignment's member has view access
-            for binding in bindings:
+            for idx, binding in enumerate(bindings):
                 # full explanation of the bit-math: https://stackoverflow.com/questions/51897160/how-to-parse-getusereffectivepermissions-sharepoint-response-in-java
                 # this approach was confirmed as valid by a Microsoft Sr. Support Escalation Engineer
                 base_permission_low = int(
                     nested_get_from_dict(binding, ["BasePermissions", "Low"], "0")  # pyright: ignore
                 )
                 role_type_kind = binding.get("RoleTypeKind", 0)
-                if (
-                    (base_permission_low & VIEW_ITEM_MASK)
-                    or (base_permission_low & VIEW_PAGE_MASK)
-                    or (role_type_kind in VIEW_ROLE_TYPES)
-                ):
+                role_name = binding.get("Name", "unknown")
+
+                has_view_item = bool(base_permission_low & VIEW_ITEM_MASK)
+                has_view_page = bool(base_permission_low & VIEW_PAGE_MASK)
+                has_view_role_type = role_type_kind in VIEW_ROLE_TYPES
+
+                self._logger.debug(
+                    f"Binding #{idx+1} for role assignment '{role_assignment_id}': "
+                    f"role_name={role_name}, role_type_kind={role_type_kind}, "
+                    f"has_view_item={has_view_item}, has_view_page={has_view_page}, "
+                    f"has_view_role_type={has_view_role_type}"
+                )
+
+                if has_view_item or has_view_page or has_view_role_type:
+                    self._logger.debug(
+                        f"Role assignment '{role_assignment_id}' grants view access "
+                        f"(via binding #{idx+1}: {role_name})"
+                    )
                     return False
 
+            self._logger.debug(
+                f"Role assignment '{role_assignment_id}' has limited access "
+                f"(no view permissions found in any binding)"
+            )
             return (
                 True  # no evidence of view access was found, so assuming limited access
             )
@@ -2411,15 +2499,34 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         if is_group:
             users = nested_get_from_dict(role_assignment, ["Member", "Users"], [])
+            self._logger.debug(
+                f"Processing group role assignment '{role_assignment_id}': "
+                f"found {len(users)} users in group"
+            )
 
             for user in users:  # pyright: ignore
-                access_control.extend(await self._access_control_for_member(user))
+                user_access_control = await self._access_control_for_member(user)
+                if user_access_control:
+                    self._logger.debug(
+                        f"Extracted access control for group member: {user_access_control}"
+                    )
+                access_control.extend(user_access_control)
         elif is_user:
             member = role_assignment.get("Member", {})
-            access_control.extend(await self._access_control_for_member(member))
+            member_title = member.get("Title", "unknown")
+            self._logger.debug(
+                f"Processing user role assignment '{role_assignment_id}': "
+                f"member_title={member_title}"
+            )
+            user_access_control = await self._access_control_for_member(member)
+            if user_access_control:
+                self._logger.debug(
+                    f"Extracted access control for user: {user_access_control}"
+                )
+            access_control.extend(user_access_control)
         else:
             self._logger.debug(
-                f"Skipping unique page permissions for identity type '{identity_type}'."
+                f"Skipping role assignment '{role_assignment_id}' with identity type '{identity_type}'"
             )
 
         return access_control
